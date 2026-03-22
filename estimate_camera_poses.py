@@ -158,7 +158,7 @@ def c2w_to_readable(c2w):
         "position_xyz": [float(v) for v in pos],
         "quaternion_wxyz": [float(q[3]), float(q[0]),
                             float(q[1]), float(q[2])],
-        "rotation_matrix_3x3": [[float(v) for v in row] for row in R],
+        "rotation_matrix_3x3_from_quaternion": [[float(v) for v in row] for row in R],
         "cam2world_4x4": [[float(v) for v in row] for row in c2w],
         "world2cam_4x4": [[float(v) for v in row] for row in w2c],
     }
