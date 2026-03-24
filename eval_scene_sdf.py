@@ -3,20 +3,21 @@
 Compute per-vertex SDF of an SMPLX body sequence against a scene mesh.
 
 Input:
-  --smplx_npz   : SMPLX parameter sequence (.npz)
-  --scene_mesh  : Scene mesh from SuGaR (.obj / .ply)
-  --mlp         : MeshLab project file (.mlp) containing the scene transform
-  --smplx_model : Path to SMPLX model files
+  --smplx_npz    : SMPLX parameter sequence (.npz)
+  --scene_mesh   : Scene mesh from SuGaR (.obj / .ply)
+  --mlp          : MeshLab project file (.mlp) with similarity transform (sRt)
+  --mesh_keyword : Keyword to select mesh entry in .mlp (default: "bg")
+  --smplx_model  : Path to SMPLX model files
 
 Output:
-  --output      : .npz with sdf [T, V], negative = penetrating
+  --output       : .npz with sdf [T, V], negative = penetrating
 
 Method: closest-face normal dot product (local sign, works for open scenes).
+Transform: sRt similarity from .mlp (scale + rotation + translation).
 """
 
 import argparse
 import os
-import re
 import time
 import xml.etree.ElementTree as ET
 
@@ -27,45 +28,56 @@ import trimesh
 
 
 # ---------------------------------------------------------------------------
-# MeshLab project (.mlp) parsing
+# MeshLab project (.mlp) parsing — sRt similarity transform
 # ---------------------------------------------------------------------------
 
-def parse_mlp_transforms(mlp_path):
+def parse_mlp_matrix(mlp_path, mesh_keyword="bg"):
     """
-    Parse a MeshLab .mlp file and return a dict: {mesh_label: 4x4 numpy matrix}.
+    Parse .mlp and return 4x4 matrix for the mesh matching *mesh_keyword*.
+    Falls back to the first entry if no keyword match.
     """
-    tree = ET.parse(mlp_path)
-    root = tree.getroot()
-    transforms = {}
-    for ml_mesh in root.iter("MLMesh"):
-        label = ml_mesh.get("label", "")
-        mat_elem = ml_mesh.find("MLMatrix44")
-        if mat_elem is not None and mat_elem.text:
-            vals = [float(x) for x in mat_elem.text.split()]
-            if len(vals) == 16:
-                transforms[label] = np.array(vals, dtype=np.float64).reshape(4, 4)
-    return transforms
+    root = ET.parse(mlp_path).getroot()
+    meshes = root.findall(".//MLMesh")
+    if not meshes:
+        raise RuntimeError(f"{mlp_path}: no MLMesh found")
+
+    chosen = None
+    kw = mesh_keyword.lower().strip()
+    if kw:
+        for mesh in meshes:
+            fn = (mesh.get("filename") or "").lower()
+            label = (mesh.get("label") or "").lower()
+            if kw in fn or kw in label:
+                chosen = mesh
+                break
+    if chosen is None:
+        chosen = meshes[0]
+
+    text = (chosen.findtext("MLMatrix44") or "").strip()
+    vals = [float(x) for x in text.split()]
+    if len(vals) != 16:
+        raise RuntimeError(f"MLMatrix44 must contain 16 floats, got {len(vals)}")
+
+    mat = np.array(vals, dtype=np.float64).reshape(4, 4)
+    name = chosen.get("filename") or chosen.get("label") or "<unknown>"
+    return mat, name
 
 
-def find_scene_transform(mlp_path, scene_mesh_path):
-    """
-    From an .mlp file, find the transform for the scene mesh.
-    Matches by filename (with or without extension differences).
-    Falls back to the first non-identity transform.
-    """
-    transforms = parse_mlp_transforms(mlp_path)
-    scene_base = os.path.splitext(os.path.basename(scene_mesh_path))[0].lower()
-
-    for label, mat in transforms.items():
-        label_base = os.path.splitext(label)[0].lower()
-        if label_base == scene_base:
-            return mat
-
-    for label, mat in transforms.items():
-        if not np.allclose(mat, np.eye(4), atol=1e-6):
-            return mat
-
-    return None
+def decompose_srt(mat):
+    """Decompose 4x4 into scale, rotation (3x3), translation (3,)."""
+    a = mat[:3, :3].copy()
+    t = mat[:3, 3].copy()
+    det_a = np.linalg.det(a)
+    if abs(det_a) < 1e-12:
+        raise RuntimeError("Transform matrix is singular")
+    s = np.cbrt(det_a)
+    r = a / s
+    u, _, vt = np.linalg.svd(r)
+    r = u @ vt
+    if np.linalg.det(r) < 0:
+        u[:, -1] *= -1
+        r = u @ vt
+    return s, r, t, a
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +174,9 @@ def main():
     ap.add_argument("--scene_mesh", required=True,
                     help="Scene mesh (.obj / .ply)")
     ap.add_argument("--mlp", default=None,
-                    help="MeshLab project file (.mlp) with scene transform")
+                    help="MeshLab project file (.mlp) with sRt similarity transform")
+    ap.add_argument("--mesh_keyword", default="bg",
+                    help="Keyword to match mesh entry in .mlp (default: bg)")
     ap.add_argument("--smplx_model", required=True,
                     help="Path to SMPLX model files")
     ap.add_argument("--gender", default="neutral")
@@ -182,12 +196,22 @@ def main():
     mesh = trimesh.load(args.scene_mesh, force="mesh", process=False)
 
     if args.mlp is not None:
-        T_mat = find_scene_transform(args.mlp, args.scene_mesh)
-        if T_mat is not None:
-            mesh.apply_transform(T_mat)
-            print(f"  Applied transform from {os.path.basename(args.mlp)}")
-        else:
-            print(f"  WARNING: no matching transform found in .mlp, using identity")
+        mat, mlp_mesh_name = parse_mlp_matrix(args.mlp, args.mesh_keyword)
+        s, r, t, a = decompose_srt(mat)
+        print(f"  .mlp mesh: {mlp_mesh_name}")
+        print(f"  scale={s:.6f}, t=[{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}]")
+
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        verts_new = (verts @ a.T) + t
+        mesh.vertices = verts_new
+
+        normals = np.asarray(mesh.face_normals, dtype=np.float64)
+        normals_new = normals @ r.T
+        norms = np.linalg.norm(normals_new, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        mesh.face_normals = normals_new / norms
+
+        print(f"  Applied sRt transform")
 
     components = mesh.split(only_watertight=False)
     if len(components) > 1:
