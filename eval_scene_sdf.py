@@ -213,11 +213,6 @@ def main():
 
         print(f"  Applied sRt transform")
 
-    components = mesh.split(only_watertight=False)
-    if len(components) > 1:
-        mesh = max(components, key=lambda c: c.area)
-        print(f"  Kept largest component")
-
     print(f"  Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
 
     mesh_query = trimesh.proximity.ProximityQuery(mesh)
